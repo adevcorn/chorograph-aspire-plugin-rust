@@ -47,7 +47,15 @@ pub fn init() {
 #[chorograph_plugin]
 pub fn identify_project(root: String, files: Vec<String>) -> Option<ProjectProfile> {
     // 1. Find a .csproj in the file list
-    let csproj_name = files.iter().find(|f| f.ends_with(".csproj"))?;
+    let csproj_files: Vec<&String> = files.iter().filter(|f| f.ends_with(".csproj")).collect();
+    log!(
+        "Aspire plugin: identify_project root={} files={} csproj_candidates={:?}",
+        root,
+        files.len(),
+        csproj_files
+    );
+
+    let csproj_name = csproj_files.into_iter().next()?;
 
     // 2. Read and check for Aspire AppHost signals
     let csproj_path = join_path(&root, csproj_name);
@@ -59,9 +67,17 @@ pub fn identify_project(root: String, files: Vec<String>) -> Option<ProjectProfi
         }
     };
 
+    log!(
+        "Aspire plugin: csproj preview (first 300 chars): {}",
+        csproj.chars().take(300).collect::<String>()
+    );
+
     if !is_aspire_apphost(&csproj) {
+        log!("Aspire plugin: not an AppHost csproj, skipping");
         return None;
     }
+
+    log!("Aspire plugin: detected Aspire AppHost at {}", root);
 
     // 3. Build tags
     let mut tags = vec![".NET".to_string(), "C#".to_string(), "Aspire".to_string()];
@@ -71,6 +87,10 @@ pub fn identify_project(root: String, files: Vec<String>) -> Option<ProjectProfi
 
     // 4. Parse resources from Program.cs / AppHost.cs
     let entry_points = detect_resource_entry_points(&root, &files);
+    log!(
+        "Aspire plugin: detected {} entry points",
+        entry_points.len()
+    );
 
     Some(ProjectProfile {
         category: "Aspire AppHost".to_string(),
@@ -130,22 +150,48 @@ fn detect_resource_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint>
         bare == "program.cs" || bare == "apphost.cs"
     });
 
+    log!(
+        "Aspire plugin: looking for Program.cs in {} files, found: {:?}",
+        files.len(),
+        program_file
+    );
+
     let rel_path = match program_file {
         Some(p) => p,
-        None => return vec![],
+        None => {
+            log!(
+                "Aspire plugin: no Program.cs found. Files list: {:?}",
+                files
+            );
+            return vec![];
+        }
     };
 
     let full_path = join_path(root, rel_path);
     let src = match read_host_file(&full_path) {
         Ok(s) => s,
-        Err(_) => return vec![],
+        Err(e) => {
+            log!("Aspire plugin: failed to read {}: {:?}", full_path, e);
+            return vec![];
+        }
     };
+
+    log!(
+        "Aspire plugin: Program.cs preview (first 400 chars): {}",
+        src.chars().take(400).collect::<String>()
+    );
 
     let mut entry_points = Vec::new();
 
     for caps in RE_ADD_RESOURCE.captures_iter(&src) {
         let add_suffix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
         let resource_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+
+        log!(
+            "Aspire plugin: found resource Add{}(\"{}\") ",
+            add_suffix,
+            resource_name
+        );
 
         // Compute 1-based line number from match offset
         let match_start = caps.get(0).map(|m| m.start()).unwrap_or(0);
@@ -163,6 +209,10 @@ fn detect_resource_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint>
         });
     }
 
+    log!(
+        "Aspire plugin: total entry points found: {}",
+        entry_points.len()
+    );
     entry_points
 }
 
