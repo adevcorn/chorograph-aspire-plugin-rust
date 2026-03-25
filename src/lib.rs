@@ -13,11 +13,27 @@ static RE_TARGET_FRAMEWORK: Lazy<Regex> =
 /// Matches any builder.Add*("name") or builder.Add*<Type>("name") call.
 /// Captures:
 ///   1 — the Add* suffix (e.g. "Project", "Postgres", "Redis", "RabbitMQ", "NpmApp", ...)
-///   2 — the resource name string argument (e.g. "api", "db", "cache")
+///   2 — the generic type argument, if present (e.g. "MyApp_Api") — optional capture group
+///   3 — the resource name string argument (e.g. "api", "db", "cache")
 static RE_ADD_RESOURCE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"builder\s*\.\s*Add([A-Za-z][A-Za-z0-9]*)\s*(?:<[^>]*>)?\s*\(\s*"([^"]+)""#)
-        .unwrap()
+    Regex::new(
+        r#"builder\s*\.\s*Add([A-Za-z][A-Za-z0-9]*)\s*(?:<\s*(?:[A-Za-z0-9_.]+\.)?([A-Za-z0-9_]+)\s*>)?\s*\(\s*"([^"]+)""#,
+    )
+    .unwrap()
 });
+
+/// Matches AddOpenApi() or AddOpenApi("docName") or AddOpenApiDefaults(...)
+/// Captures optional document name (group 1).
+static RE_ADD_OPENAPI: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"AddOpenApi(?:Defaults)?\s*\(\s*(?:"([^"]*)")?"#).unwrap());
+
+/// Matches MapOpenApi() or MapOpenApi("docName") or MapOpenApi("/path/{documentName}/...")
+/// Captures optional document name or path (group 1).
+static RE_MAP_OPENAPI: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"MapOpenApi\s*\(\s*(?:"([^"]*)")?"#).unwrap());
+
+/// Matches AddSwaggerGen() (Swashbuckle)
+static RE_ADD_SWAGGER: Lazy<Regex> = Lazy::new(|| Regex::new(r"AddSwaggerGen\s*\(").unwrap());
 
 // ---------------------------------------------------------------------------
 // Aspire AppHost detection signals
@@ -47,15 +63,7 @@ pub fn init() {
 #[chorograph_plugin]
 pub fn identify_project(root: String, files: Vec<String>) -> Option<ProjectProfile> {
     // 1. Find a .csproj in the file list
-    let csproj_files: Vec<&String> = files.iter().filter(|f| f.ends_with(".csproj")).collect();
-    log!(
-        "Aspire plugin: identify_project root={} files={} csproj_candidates={:?}",
-        root,
-        files.len(),
-        csproj_files
-    );
-
-    let csproj_name = csproj_files.into_iter().next()?;
+    let csproj_name = files.iter().find(|f| f.ends_with(".csproj"))?;
 
     // 2. Read and check for Aspire AppHost signals
     let csproj_path = join_path(&root, csproj_name);
@@ -67,13 +75,7 @@ pub fn identify_project(root: String, files: Vec<String>) -> Option<ProjectProfi
         }
     };
 
-    log!(
-        "Aspire plugin: csproj preview (first 300 chars): {}",
-        csproj.chars().take(300).collect::<String>()
-    );
-
     if !is_aspire_apphost(&csproj) {
-        log!("Aspire plugin: not an AppHost csproj, skipping");
         return None;
     }
 
@@ -85,10 +87,10 @@ pub fn identify_project(root: String, files: Vec<String>) -> Option<ProjectProfi
         tags.push(tf);
     }
 
-    // 4. Parse resources from Program.cs / AppHost.cs
+    // 4. Parse resources from Program.cs / AppHost.cs (including OAS detection)
     let entry_points = detect_resource_entry_points(&root, &files);
     log!(
-        "Aspire plugin: detected {} entry points",
+        "Aspire plugin: {} entry points detected",
         entry_points.len()
     );
 
@@ -106,7 +108,7 @@ pub fn handle_action(_action_id: String, _payload: serde_json::Value) {
 
 #[chorograph_plugin]
 pub fn detect_run_status(root: String) -> Option<RunStatus> {
-    // Quick check: find and read .csproj to confirm this is an Aspire AppHost
+    // Quick check: confirm this is an Aspire AppHost
     let csproj = find_and_read_csproj(&root)?;
     if !is_aspire_apphost(&csproj) {
         return None;
@@ -125,15 +127,12 @@ pub fn detect_run_status(root: String) -> Option<RunStatus> {
         });
     }
 
-    // Dashboard is up — try to fetch per-resource status from the Dashboard API
     let dashboard_url = format!("http://localhost:{}", dashboard_port);
-    let resources = fetch_resource_statuses(&dashboard_url);
-
     Some(RunStatus {
         is_running: true,
         url: Some(dashboard_url),
         pid: None,
-        resources,
+        resources: vec![],
     })
 }
 
@@ -142,7 +141,8 @@ pub fn detect_run_status(root: String) -> Option<RunStatus> {
 // ---------------------------------------------------------------------------
 
 /// Parse builder.Add*() calls from Program.cs / AppHost.cs and return each
-/// orchestrated resource as an EntryPoint.
+/// orchestrated resource as an EntryPoint. For project resources, also probes
+/// the project source for OpenAPI registration and emits additional OAS entry points.
 fn detect_resource_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint> {
     // Find Program.cs or AppHost.cs (case-insensitive)
     let program_file = files.iter().find(|f| {
@@ -150,21 +150,9 @@ fn detect_resource_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint>
         bare == "program.cs" || bare == "apphost.cs"
     });
 
-    log!(
-        "Aspire plugin: looking for Program.cs in {} files, found: {:?}",
-        files.len(),
-        program_file
-    );
-
     let rel_path = match program_file {
         Some(p) => p,
-        None => {
-            log!(
-                "Aspire plugin: no Program.cs found. Files list: {:?}",
-                files
-            );
-            return vec![];
-        }
+        None => return vec![],
     };
 
     let full_path = join_path(root, rel_path);
@@ -176,22 +164,13 @@ fn detect_resource_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint>
         }
     };
 
-    log!(
-        "Aspire plugin: Program.cs preview (first 400 chars): {}",
-        src.chars().take(400).collect::<String>()
-    );
-
     let mut entry_points = Vec::new();
 
     for caps in RE_ADD_RESOURCE.captures_iter(&src) {
         let add_suffix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        let resource_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
-        log!(
-            "Aspire plugin: found resource Add{}(\"{}\") ",
-            add_suffix,
-            resource_name
-        );
+        // Group 2 is the generic type name (only present for AddProject<T>)
+        let type_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let resource_name = caps.get(3).map(|m| m.as_str()).unwrap_or("");
 
         // Compute 1-based line number from match offset
         let match_start = caps.get(0).map(|m| m.start()).unwrap_or(0);
@@ -203,17 +182,191 @@ fn detect_resource_entry_points(root: &str, files: &[String]) -> Vec<EntryPoint>
             label,
             path: rel_path.clone(),
             line: Some(line),
-            method: Some(kind),
+            method: Some(kind.clone()),
             description: Some(format!("builder.Add{}(\"{}\")", add_suffix, resource_name)),
+            detection_source: Some("regex".to_string()),
+        });
+
+        // For project resources, try to detect OAS in the referenced project's source
+        if kind == "PROJECT" && !type_name.is_empty() {
+            let oas_entries = detect_oas_entry_points(root, type_name, resource_name);
+            entry_points.extend(oas_entries);
+        }
+    }
+
+    entry_points
+}
+
+/// Given an Aspire-orchestrated project's generic type name (e.g. "MyApp_Api")
+/// and its Aspire resource name (e.g. "api"), try to find the project directory,
+/// read its Program.cs, and detect OpenAPI registration.
+/// Returns a list of OAS entry points (e.g. "/openapi/v1.json").
+fn detect_oas_entry_points(
+    apphost_root: &str,
+    type_name: &str,
+    resource_name: &str,
+) -> Vec<EntryPoint> {
+    // The generic type name in Aspire uses underscores where the folder/namespace uses dots.
+    // e.g. "MyApp_Api" → folder "MyApp.Api"
+    // We'll try a few candidate folder names relative to common parent layouts:
+    //   - sibling of the AppHost (most common: all projects under a shared src/ or repo root)
+    //   - direct sibling of AppHost root
+    let folder_name = type_name.replace('_', ".");
+
+    // Determine the parent directory (one level up from AppHost root)
+    let parent = apphost_root
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .map(|(p, _)| p)
+        .unwrap_or(apphost_root);
+
+    // Candidate directories to probe:
+    // 1. <parent>/<FolderName>          e.g. /repo/src/MyApp.Api
+    // 2. <parent>/src/<FolderName>      (grandparent/src/<name> when AppHost is nested deeper)
+    // 3. <apphost_root>/../<FolderName> (same as #1 via parent)
+    let grandparent = parent.rsplit_once('/').map(|(p, _)| p).unwrap_or(parent);
+
+    let candidates = [
+        format!("{}/{}", parent, folder_name),
+        format!("{}/src/{}", grandparent, folder_name),
+        format!("{}/{}", grandparent, folder_name),
+    ];
+
+    for candidate_dir in &candidates {
+        if let Some(entries) = try_read_oas_from_project(candidate_dir, resource_name) {
+            return entries;
+        }
+    }
+
+    vec![]
+}
+
+/// Try to read Program.cs (or App.cs / Startup.cs) from a candidate project
+/// directory and detect OpenAPI registration. Returns None if the directory
+/// doesn't look like a valid project.
+fn try_read_oas_from_project(project_dir: &str, resource_name: &str) -> Option<Vec<EntryPoint>> {
+    // Try to read a .csproj to confirm this is actually a project directory.
+    // We derive the csproj name from the last path component.
+    let basename = project_dir
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    if basename.is_empty() {
+        return None;
+    }
+
+    let csproj_path = format!("{}/{}.csproj", project_dir, basename);
+    // If the csproj doesn't exist, this isn't the right directory
+    if read_host_file(&csproj_path).is_err() {
+        return None;
+    }
+
+    // Read Program.cs (the most common entry point file)
+    let program_path = format!("{}/Program.cs", project_dir);
+    let src = match read_host_file(&program_path) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    let oas_entries = extract_oas_entry_points_from_source(&src, resource_name, "Program.cs");
+    Some(oas_entries)
+}
+
+/// Scan a source file for OpenAPI registrations and return entry points.
+fn extract_oas_entry_points_from_source(
+    src: &str,
+    resource_name: &str,
+    rel_path: &str,
+) -> Vec<EntryPoint> {
+    let mut entries = Vec::new();
+
+    // Check for Swashbuckle first (less common in modern .NET)
+    if RE_ADD_SWAGGER.is_match(src) {
+        entries.push(EntryPoint {
+            label: format!("{}: /swagger/v1/swagger.json", resource_name),
+            path: rel_path.to_string(),
+            line: None,
+            method: Some("OAS".to_string()),
+            description: Some("OpenAPI spec (Swashbuckle)".to_string()),
+            detection_source: Some("regex".to_string()),
+        });
+        return entries;
+    }
+
+    // Collect document names from AddOpenApi calls
+    let mut doc_names: Vec<String> = RE_ADD_OPENAPI
+        .captures_iter(src)
+        .map(|caps| {
+            caps.get(1)
+                .map(|m| m.as_str().to_string())
+                // Empty string capture or no capture → default name "v1"
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "v1".to_string())
+        })
+        .collect();
+
+    if doc_names.is_empty() {
+        // No AddOpenApi found — no OAS in this project
+        return entries;
+    }
+
+    // Deduplicate
+    doc_names.sort();
+    doc_names.dedup();
+
+    // Check if MapOpenApi is also present (confirms the route is actually registered)
+    let map_openapi_present = RE_MAP_OPENAPI.is_match(src);
+
+    // If MapOpenApi is present, collect any custom path overrides
+    // (e.g. MapOpenApi("/openapi/{documentName}/openapi.json"))
+    let custom_paths: Vec<String> = if map_openapi_present {
+        RE_MAP_OPENAPI
+            .captures_iter(src)
+            .filter_map(|caps| {
+                caps.get(1).and_then(|m| {
+                    let s = m.as_str();
+                    // Only treat it as a custom path template if it contains '{'
+                    if s.contains('{') {
+                        Some(s.to_string())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    for doc in &doc_names {
+        // If there's a custom path template, use it; otherwise use the default
+        let spec_path = if let Some(template) = custom_paths.first() {
+            template.replace("{documentName}", doc)
+        } else {
+            format!("/openapi/{}.json", doc)
+        };
+
+        let desc = if map_openapi_present {
+            format!("OpenAPI spec for document \"{}\"", doc)
+        } else {
+            format!(
+                "OpenAPI spec for document \"{}\" (MapOpenApi not detected — may be dev-only)",
+                doc
+            )
+        };
+
+        entries.push(EntryPoint {
+            label: format!("{}: {}", resource_name, spec_path),
+            path: rel_path.to_string(),
+            line: None,
+            method: Some("OAS".to_string()),
+            description: Some(desc),
             detection_source: Some("regex".to_string()),
         });
     }
 
-    log!(
-        "Aspire plugin: total entry points found: {}",
-        entry_points.len()
-    );
-    entry_points
+    entries
 }
 
 /// Map the Add* suffix + resource name to a human-readable label and a method/kind string.
@@ -253,6 +406,10 @@ fn classify_resource(add_suffix: &str, name: &str) -> (String, String) {
             format!("container: {} (sqlserver)", name),
             "CONTAINER".to_string(),
         ),
+        "valkey" => (
+            format!("container: {} (valkey)", name),
+            "CONTAINER".to_string(),
+        ),
         "npmapp" | "nodejsapp" => (format!("resource: {} (npm)", name), "RESOURCE".to_string()),
         "executable" => (
             format!("resource: {} (executable)", name),
@@ -267,117 +424,6 @@ fn classify_resource(add_suffix: &str, name: &str) -> (String, String) {
             "RESOURCE".to_string(),
         ),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Aspire Dashboard API — per-resource status
-// ---------------------------------------------------------------------------
-
-/// Attempt to fetch resource statuses from the Aspire Dashboard REST API.
-/// Returns an empty vec if the API is unavailable or returns unexpected data.
-/// The Aspire Dashboard exposes resources at: GET /api/v1/resources
-fn fetch_resource_statuses(dashboard_url: &str) -> Vec<ResourceStatus> {
-    let url = format!("{}/api/v1/resources", dashboard_url);
-
-    let response = match http_get(&url, None) {
-        Ok(r) => r,
-        Err(e) => {
-            log!(
-                "Aspire plugin: Dashboard API unavailable at {}: {:?}",
-                url,
-                e
-            );
-            return vec![];
-        }
-    };
-
-    if response.status != 200 {
-        log!(
-            "Aspire plugin: Dashboard API returned status {}",
-            response.status
-        );
-        return vec![];
-    }
-
-    parse_dashboard_resources(&response.body)
-}
-
-/// Parse the Aspire Dashboard /api/v1/resources JSON response into ResourceStatus vec.
-///
-/// The Dashboard returns a structure like:
-/// {
-///   "resources": [
-///     {
-///       "name": "api",
-///       "resourceType": "Project",
-///       "state": "Running",
-///       "urls": [{ "fullUrl": "https://localhost:7241", ... }],
-///       ...
-///     },
-///     ...
-///   ]
-/// }
-fn parse_dashboard_resources(body: &str) -> Vec<ResourceStatus> {
-    // Parse as generic JSON — avoid a heavyweight schema dependency
-    let root: serde_json::Value = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(e) => {
-            log!("Aspire plugin: failed to parse Dashboard response: {}", e);
-            return vec![];
-        }
-    };
-
-    let resources_arr = match root.get("resources").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => {
-            log!("Aspire plugin: no 'resources' array in Dashboard response");
-            return vec![];
-        }
-    };
-
-    let mut out = Vec::new();
-
-    for item in resources_arr {
-        let name = item
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        if name.is_empty() {
-            continue;
-        }
-
-        let resource_type = item
-            .get("resourceType")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_lowercase();
-
-        let state = item
-            .get("state")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        // Extract the first URL from the urls array
-        let url = item
-            .get("urls")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|u| u.get("fullUrl"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        out.push(ResourceStatus {
-            name,
-            kind: resource_type,
-            state,
-            url,
-        });
-    }
-
-    out
 }
 
 // ---------------------------------------------------------------------------
